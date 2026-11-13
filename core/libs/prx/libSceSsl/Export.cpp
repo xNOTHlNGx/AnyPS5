@@ -74,8 +74,14 @@ constexpr std::uint32_t FlagCnCheck = 0x4;
 constexpr std::uint32_t FlagNotAfterCheck = 0x8;
 constexpr std::uint32_t FlagNotBeforeCheck = 0x10;
 constexpr std::uint32_t FlagKnownCaCheck = 0x20;
-constexpr std::uint32_t VerifyOptionMask = 0x3f;
-constexpr std::uint32_t InitialVerifyOptions = FlagServerVerify | FlagCnCheck | FlagKnownCaCheck;
+constexpr std::uint32_t FlagServerName = 0x80;
+constexpr std::uint32_t FlagNetworkRoots = 0x100;
+constexpr std::uint32_t FlagRejectSha1Rsa = 0x2000;
+constexpr std::uint32_t VerifyOptionMask = 0x20bf;
+constexpr std::uint32_t InternalOptionMask = 0x3dff;
+constexpr std::uint32_t VerifyOptionClearable = 0x201a;
+constexpr std::uint32_t InternalOptionClearable = 0x385a;
+constexpr std::uint32_t InitialVerifyOptions = FlagServerVerify | FlagCnCheck | FlagKnownCaCheck | FlagServerName | 0x400;
 
 constexpr std::int64_t TicksPerSecond = 1000000;
 constexpr std::int64_t TicksPerMinute = 60 * TicksPerSecond;
@@ -379,6 +385,7 @@ struct Session {
     PrivateKey privateKey;
     mbedtls_x509_crt authorities;
     mbedtls_x509_crt* linkedSystemRoots = nullptr;
+    mbedtls_x509_crt_profile profile = mbedtls_x509_crt_profile_default;
     mbedtls_ssl_config config;
     mbedtls_ssl_context ssl;
 
@@ -398,6 +405,10 @@ struct Session {
     }
 
     void Configure(const std::string& host, const std::string& alpn, std::uint32_t options, const mbedtls_x509_crt* systemRoots = nullptr) {
+        if (!(options & FlagServerName))
+            throw std::logic_error("SSL: a handshake without the server name extension (option 0x80 cleared) is not supported");
+        if (options & FlagNetworkRoots)
+            throw std::logic_error("SSL: option 0x100 trusts only the console's PlayStation Network roots, which are not available");
         verifyOptions = options;
         random.Seed();
         for (const auto& chain : context->authorities)
@@ -414,6 +425,8 @@ struct Session {
         CheckBackend(mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT),
             "SSL client configuration failed");
         mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_OPTIONAL);
+        profile.allowed_mds |= MBEDTLS_X509_ID_FLAG(MBEDTLS_MD_SHA1) | MBEDTLS_X509_ID_FLAG(MBEDTLS_MD_SHA224) | MBEDTLS_X509_ID_FLAG(MBEDTLS_MD_RIPEMD160);
+        mbedtls_ssl_conf_cert_profile(&config, &profile);
         mbedtls_ssl_conf_min_tls_version(&config, MBEDTLS_SSL_VERSION_TLS1_2);
         mbedtls_ssl_conf_ca_chain(&config, trusted, nullptr);
         mbedtls_ssl_conf_rng(&config, mbedtls_ctr_drbg_random, &random.drbg);
@@ -494,9 +507,12 @@ struct Session {
         const auto flags = mbedtls_ssl_get_verify_result(&ssl);
         failedOptions = 0;
         if (!(verifyOptions & FlagServerVerify)) return;
-        constexpr std::uint32_t optional =
-            MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE;
+        constexpr std::uint32_t optional = MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_EXPIRED
+            | MBEDTLS_X509_BADCERT_FUTURE | MBEDTLS_X509_BADCERT_BAD_MD;
         if ((verifyOptions & FlagKnownCaCheck) && (flags & ~optional)) failedOptions |= DetailChain;
+        if (flags & MBEDTLS_X509_BADCERT_BAD_MD) failedOptions |= DetailChain;
+        for (const auto* certificate = mbedtls_ssl_get_peer_cert(&ssl); (verifyOptions & FlagRejectSha1Rsa) && certificate && certificate->raw.p; certificate = certificate->next)
+            if (certificate->MBEDTLS_PRIVATE(sig_pk) == MBEDTLS_PK_RSA && certificate->MBEDTLS_PRIVATE(sig_md) == MBEDTLS_MD_SHA1) failedOptions |= DetailChain;
         if ((verifyOptions & FlagKnownCaCheck) && (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)) failedOptions |= FlagKnownCaCheck;
         if ((verifyOptions & FlagCnCheck) && (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)) failedOptions |= FlagCnCheck;
         if ((verifyOptions & FlagNotAfterCheck) && (flags & MBEDTLS_X509_BADCERT_EXPIRED)) failedOptions |= FlagNotAfterCheck;
@@ -603,6 +619,16 @@ std::uint32_t CompiledSdkVersion() {
     std::uint32_t sdkVersion;
     std::memcpy(&sdkVersion, parameters + 16, sizeof(sdkVersion));
     return sdkVersion;
+}
+
+int ChangeOptions(int sslConnectionId, std::uint32_t option, std::uint32_t allowed, bool enable, std::uint32_t clearable) {
+    if (option & ~allowed) return ErrorInvalidValue;
+    std::lock_guard lock(State().mutex);
+    auto* connection = FindConnection(sslConnectionId);
+    if (!connection) return ErrorInvalidId;
+    if (enable) connection->verifyOptions |= option;
+    else connection->verifyOptions &= ~(connection->verifyOptions & FlagNetworkRoots ? option & clearable : option);
+    return 0;
 }
 
 void RequireUsable(const char* function, const Session& session) {
@@ -1225,21 +1251,11 @@ int APS5_VABI sceSslFreeSslCertName(int sslCtxId, void* certName) {
 }
 
 int APS5_VABI sceSslEnableVerifyOption(int sslConnectionId, std::uint32_t option) {
-    std::lock_guard lock(State().mutex);
-    auto* connection = FindConnection(sslConnectionId);
-    if (!connection) return ErrorInvalidId;
-    if (option & ~VerifyOptionMask) return ErrorInvalidValue;
-    connection->verifyOptions |= option;
-    return 0;
+    return ChangeOptions(sslConnectionId, option, VerifyOptionMask, true, 0);
 }
 
 int APS5_VABI sceSslDisableVerifyOption(int sslConnectionId, std::uint32_t option) {
-    std::lock_guard lock(State().mutex);
-    auto* connection = FindConnection(sslConnectionId);
-    if (!connection) return ErrorInvalidId;
-    if (option & ~VerifyOptionMask) return ErrorInvalidValue;
-    connection->verifyOptions &= ~option;
-    return 0;
+    return ChangeOptions(sslConnectionId, option, VerifyOptionMask, false, VerifyOptionClearable);
 }
 
 const char* APS5_VABI sceSslGetAlpnSelected(int sslConnectionId) {
@@ -1462,23 +1478,20 @@ int APS5_VABI sceSslDisableOption(int sslConnectionId, std::uint32_t option) {
     return sceSslDisableVerifyOption(sslConnectionId, option);
 }
 
-int APS5_VABI sceSslDisableOptionInternal() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslDisableOptionInternal(int sslConnectionId, std::uint32_t option) {
+    return ChangeOptions(sslConnectionId, option, InternalOptionMask, false, InternalOptionClearable);
 }
 
-int APS5_VABI sceSslDisableOptionInternalInsecure() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslDisableOptionInternalInsecure(int sslConnectionId, std::uint32_t option) {
+    return ChangeOptions(sslConnectionId, option, InternalOptionMask, false, InternalOptionClearable);
 }
 
 int APS5_VABI sceSslEnableOption(int sslConnectionId, std::uint32_t option) {
     return sceSslEnableVerifyOption(sslConnectionId, option);
 }
 
-int APS5_VABI sceSslEnableOptionInternal() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslEnableOptionInternal(int sslConnectionId, std::uint32_t option) {
+    return ChangeOptions(sslConnectionId, option, InternalOptionMask, true, 0);
 }
 
 int APS5_VABI sceSslGetNanoSSLModuleId(int sslCtxId, int* moduleId) {

@@ -67,7 +67,7 @@ constexpr std::size_t SplitRequestSize = 20000;
 const char* ServerProtocols[] = {"http/1.1", nullptr};
 
 enum class Serve { Close, Exchange, Split, Drop, Reset, Alert, HelloReset, HelloPlain };
-enum class Leaf { Valid, Expired, Future };
+enum class Leaf { Valid, Expired, Future, Sha1Rsa };
 
 struct GuestTimeval {
     std::int64_t seconds;
@@ -136,11 +136,13 @@ struct Server {
     mbedtls_x509_crt certificate;
     mbedtls_x509_crt expiredCertificate;
     mbedtls_x509_crt futureCertificate;
+    mbedtls_x509_crt sha1Certificate;
     mbedtls_x509_crt authority;
     mbedtls_pk_context key;
     mbedtls_pk_context expiredKey;
     mbedtls_pk_context futureKey;
-    mbedtls_ssl_config configs[3];
+    mbedtls_pk_context sha1Key;
+    mbedtls_ssl_config configs[4];
     mbedtls_ssl_cache_context cache;
     std::atomic<int> resumed{0};
     std::uint16_t port = 0;
@@ -164,10 +166,12 @@ struct Server {
         mbedtls_x509_crt_init(&certificate);
         mbedtls_x509_crt_init(&expiredCertificate);
         mbedtls_x509_crt_init(&futureCertificate);
+        mbedtls_x509_crt_init(&sha1Certificate);
         mbedtls_x509_crt_init(&authority);
         mbedtls_pk_init(&key);
         mbedtls_pk_init(&expiredKey);
         mbedtls_pk_init(&futureKey);
+        mbedtls_pk_init(&sha1Key);
         for (auto& config : configs) mbedtls_ssl_config_init(&config);
         mbedtls_ssl_cache_init(&cache);
         Require(mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy, nullptr, 0) == 0, "seed server random generator");
@@ -185,9 +189,13 @@ struct Server {
             "parse future server certificate");
         Require(mbedtls_pk_parse_key(&futureKey, reinterpret_cast<const unsigned char*>(FutureServerKey), sizeof(FutureServerKey), nullptr, 0,
             mbedtls_ctr_drbg_random, &drbg) == 0, "parse future server key");
-        mbedtls_x509_crt* leaves[] = {&certificate, &expiredCertificate, &futureCertificate};
-        mbedtls_pk_context* keys[] = {&key, &expiredKey, &futureKey};
-        for (int index = 0; index < 3; ++index) {
+        Require(mbedtls_x509_crt_parse(&sha1Certificate, reinterpret_cast<const unsigned char*>(Sha1ServerPem), sizeof(Sha1ServerPem)) == 0,
+            "parse SHA-1 server certificate");
+        Require(mbedtls_pk_parse_key(&sha1Key, reinterpret_cast<const unsigned char*>(Sha1ServerKey), sizeof(Sha1ServerKey), nullptr, 0,
+            mbedtls_ctr_drbg_random, &drbg) == 0, "parse SHA-1 server key");
+        mbedtls_x509_crt* leaves[] = {&certificate, &expiredCertificate, &futureCertificate, &sha1Certificate};
+        mbedtls_pk_context* keys[] = {&key, &expiredKey, &futureKey, &sha1Key};
+        for (int index = 0; index < 4; ++index) {
             auto& config = configs[index];
             Require(mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_SERVER, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) == 0,
                 "configure server");
@@ -212,10 +220,12 @@ struct Server {
     ~Server() {
         for (auto& config : configs) mbedtls_ssl_config_free(&config);
         mbedtls_ssl_cache_free(&cache);
+        mbedtls_pk_free(&sha1Key);
         mbedtls_pk_free(&futureKey);
         mbedtls_pk_free(&expiredKey);
         mbedtls_pk_free(&key);
         mbedtls_x509_crt_free(&authority);
+        mbedtls_x509_crt_free(&sha1Certificate);
         mbedtls_x509_crt_free(&futureCertificate);
         mbedtls_x509_crt_free(&expiredCertificate);
         mbedtls_x509_crt_free(&certificate);
@@ -438,6 +448,8 @@ int main(int argc, char** argv) {
         server.Serve(Serve::Close);
         server.Serve(Serve::Split);
         server.Serve(Serve::Exchange);
+        server.Serve(Serve::Close, false, Leaf::Sha1Rsa);
+        server.Serve(Serve::Close, false, Leaf::Sha1Rsa);
         for (int index = 0; index < ParallelConnections; ++index) server.Serve(Serve::Exchange);
     });
 
@@ -458,8 +470,12 @@ int main(int argc, char** argv) {
         && sceSslEnableVerifyOption(untrusted, CnCheck) == ErrorInvalidId && sceSslDisableVerifyOption(untrusted, CnCheck) == ErrorInvalidId
         && sceSslSetMinSslVersion(untrusted, VersionTls12) == ErrorInvalidId && sceSslSetVerifyCallback(untrusted, nullptr, nullptr) == ErrorInvalidId
         && sceSslReuseConnection(untrusted, untrustedSocket) == ErrorInvalidId && sceSslEnableOption(untrusted, CnCheck) == ErrorInvalidId
-        && sceSslDisableOption(untrusted, CnCheck) == ErrorInvalidId,
+        && sceSslDisableOption(untrusted, CnCheck) == ErrorInvalidId && sceSslEnableOptionInternal(untrusted, CnCheck) == ErrorInvalidId
+        && sceSslDisableOptionInternal(untrusted, CnCheck) == ErrorInvalidId && sceSslDisableOptionInternalInsecure(untrusted, CnCheck) == ErrorInvalidId
+        && sceSslEnableVerifyOption(0, CnCheck) == ErrorInvalidId,
         "a deleted connection did not report an invalid id");
+    Require(sceSslEnableVerifyOption(untrusted, 0x40) == ErrorInvalidValue && sceSslDisableOptionInternal(untrusted, 0x200) == ErrorInvalidValue,
+        "the option bits were not checked before the connection id");
     SslError untouched{7, 7};
     Require(sceSslGetSslError(untrusted, &untouched.error, &untouched.detail) == ErrorInvalidId && untouched == SslError{7, 7}
         && sceSslGetSslError(0, &untouched.error, &untouched.detail) == ErrorInvalidId, "the SSL error of a deleted connection or id 0 was read");
@@ -541,6 +557,18 @@ int main(int argc, char** argv) {
     Require(sceSslEnableOption(optioned, 0x40) == ErrorInvalidValue && sceSslDisableOption(optioned, 0x1000) == ErrorInvalidValue,
         "the option calls accepted bits the verify option calls refuse");
     Require(sceSslDisableOption(optioned, CnCheck) == 0 && sceSslEnableOption(optioned, NotBeforeCheck) == 0, "set the options");
+    Require(sceSslEnableVerifyOption(optioned, 0x200) == ErrorInvalidValue && sceSslDisableVerifyOption(optioned, 0x400) == ErrorInvalidValue
+        && sceSslEnableOptionInternal(optioned, 0x200) == ErrorInvalidValue && sceSslEnableOptionInternal(optioned, 0x4000) == ErrorInvalidValue
+        && sceSslDisableOptionInternalInsecure(optioned, 0x4000) == ErrorInvalidValue, "option bits outside the masks were accepted");
+    Require(sceSslEnableVerifyOption(optioned, 0x80) == 0 && sceSslEnableOptionInternal(optioned, 0x1c00) == 0 && sceSslDisableOptionInternal(optioned, 0x1c00) == 0,
+        "option bits inside the masks were refused");
+    Require(sceSslDisableOptionInternalInsecure(optioned, 0x80) == 0 && Throws([&] { sceSslConnect(optioned); }),
+        "a handshake without the server name extension was attempted");
+    Require(sceSslEnableOptionInternal(optioned, 0x80) == 0, "restore the server name option");
+    const int networkRoots = sceSslCreateConnection(context, optionSocket, "localhost");
+    Require(sceSslEnableOptionInternal(networkRoots, 0x100) == 0 && sceSslDisableOptionInternalInsecure(networkRoots, 0x100) == 0
+        && Throws([&] { sceSslConnect(networkRoots); }), "option 0x100 was cleared or its roots were assumed");
+    Require(sceSslDeleteConnection(networkRoots) == 0, "release the connection with option 0x100");
     Require(sceSslConnect(optioned) == 0, "the option calls did not change the connection's verify options");
     Require(sceSslDeleteConnection(optioned) == 0 && sockets.Close(optionSocket) == 0, "release the connection set through the option calls");
 
@@ -792,6 +820,23 @@ int main(int argc, char** argv) {
     Require(received == 4 && std::memcmp(buffer.data(), "pong", 4) == 0, "read the single-transfer non-blocking reply");
     Require(sceSslDeleteConnection(eagain) == 0 && sockets.Close(eagainSocket) == 0, "a single-transfer connection was not released by sceSslDeleteConnection");
     Require(InUse(context) == loaded, "the single-transfer connections did not return their pool memory");
+
+    const int rsaContext = sceSslInit_nid_postfix(256 * 1024);
+    std::string rsaRoot = RsaRootPem;
+    SceSsl::Data rsaAuthority{reinterpret_cast<std::uint8_t*>(rsaRoot.data()), rsaRoot.size()};
+    auto* rsaAuthorities = &rsaAuthority;
+    Require(sceSslLoadCert(rsaContext, 1, &rsaAuthorities, nullptr, nullptr) == 0, "load the RSA test root");
+    const int sha1Socket = sockets.Open(server.port);
+    const int sha1 = sceSslCreateConnection(rsaContext, sha1Socket, "localhost");
+    Require(sceSslConnect(sha1) == 0 && LastError(sha1) == SslError{}, "a SHA-1 RSA signature was refused without option 0x2000");
+    Require(sceSslDeleteConnection(sha1) == 0 && sockets.Close(sha1Socket) == 0, "release the SHA-1 connection");
+    const int sha1CheckedSocket = sockets.Open(server.port);
+    const int sha1Checked = sceSslCreateConnection(rsaContext, sha1CheckedSocket, "localhost");
+    Require(sceSslEnableVerifyOption(sha1Checked, 0x2000) == 0, "enable option 0x2000");
+    Require(sceSslConnect(sha1Checked) == ErrorInvalidCert && LastError(sha1Checked) == SslError{ErrorInvalidCert, 0x2},
+        "a SHA-1 RSA signature passed option 0x2000");
+    Require(sceSslDeleteConnection(sha1Checked) == 0 && sockets.Close(sha1CheckedSocket) == 0, "release the checked SHA-1 connection");
+    Require(sceSslTerm_nid_postfix(rsaContext) == 0, "terminate the RSA test context");
 
     std::array<std::thread, ParallelConnections> clients;
     for (auto& client : clients) {

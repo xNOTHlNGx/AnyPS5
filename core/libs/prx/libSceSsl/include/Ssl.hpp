@@ -49,10 +49,10 @@ int APS5_VABI sceSslCheckRecvPending(int sslConnectionId, std::uint8_t* pending)
 int APS5_VABI sceSslCreateSslConnection(int sslCtxId, int sockId, const char* host);
 int APS5_VABI sceSslDeleteSslConnection(int sslConnectionId);
 int APS5_VABI sceSslDisableOption(int sslConnectionId, std::uint32_t option);
-int APS5_VABI sceSslDisableOptionInternal();
-int APS5_VABI sceSslDisableOptionInternalInsecure();
+int APS5_VABI sceSslDisableOptionInternal(int sslConnectionId, std::uint32_t option);
+int APS5_VABI sceSslDisableOptionInternalInsecure(int sslConnectionId, std::uint32_t option);
 int APS5_VABI sceSslEnableOption(int sslConnectionId, std::uint32_t option);
-int APS5_VABI sceSslEnableOptionInternal();
+int APS5_VABI sceSslEnableOptionInternal(int sslConnectionId, std::uint32_t option);
 int APS5_VABI sceSslGetNanoSSLModuleId(int sslCtxId, int* moduleId);
 int APS5_VABI sceSslGetPeerCert();
 int APS5_VABI sceSslGetSslError(int sslConnectionId, int* errNum, std::uint32_t* detail);
