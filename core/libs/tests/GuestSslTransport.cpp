@@ -420,7 +420,7 @@ int main(int argc, char** argv) {
     Server server;
     std::thread serving([&] {
         for (int index = 0; index < 4; ++index) server.Serve(Serve::Close, false);
-        for (int index = 0; index < 6; ++index) server.Serve(Serve::Close);
+        for (int index = 0; index < 7; ++index) server.Serve(Serve::Close);
         server.Serve(Serve::Exchange);
         server.Serve(Serve::Exchange);
         server.Serve(Serve::Drop);
@@ -457,7 +457,8 @@ int main(int argc, char** argv) {
         && sceSslWrite(untrusted, scratch.data(), 1, 0) == ErrorInvalidId && sceSslSetAlpn(untrusted, "h2") == ErrorInvalidId
         && sceSslEnableVerifyOption(untrusted, CnCheck) == ErrorInvalidId && sceSslDisableVerifyOption(untrusted, CnCheck) == ErrorInvalidId
         && sceSslSetMinSslVersion(untrusted, VersionTls12) == ErrorInvalidId && sceSslSetVerifyCallback(untrusted, nullptr, nullptr) == ErrorInvalidId
-        && sceSslReuseConnection(untrusted, untrustedSocket) == ErrorInvalidId,
+        && sceSslReuseConnection(untrusted, untrustedSocket) == ErrorInvalidId && sceSslEnableOption(untrusted, CnCheck) == ErrorInvalidId
+        && sceSslDisableOption(untrusted, CnCheck) == ErrorInvalidId,
         "a deleted connection did not report an invalid id");
     SslError untouched{7, 7};
     Require(sceSslGetSslError(untrusted, &untouched.error, &untouched.detail) == ErrorInvalidId && untouched == SslError{7, 7}
@@ -535,6 +536,13 @@ int main(int argc, char** argv) {
     Require(sceSslDisableVerifyOption(lenient, CnCheck) == 0, "disable the host name check");
     Require(sceSslConnect(lenient) == 0, "a disabled host name check still failed the handshake");
     Require(sceSslDeleteConnection(lenient) == 0 && sockets.Close(lenientSocket) == 0, "release the lenient connection");
+    const int optionSocket = sockets.Open(server.port);
+    const int optioned = sceSslCreateConnection(context, optionSocket, "example.com");
+    Require(sceSslEnableOption(optioned, 0x40) == ErrorInvalidValue && sceSslDisableOption(optioned, 0x1000) == ErrorInvalidValue,
+        "the option calls accepted bits the verify option calls refuse");
+    Require(sceSslDisableOption(optioned, CnCheck) == 0 && sceSslEnableOption(optioned, NotBeforeCheck) == 0, "set the options");
+    Require(sceSslConnect(optioned) == 0, "the option calls did not change the connection's verify options");
+    Require(sceSslDeleteConnection(optioned) == 0 && sockets.Close(optionSocket) == 0, "release the connection set through the option calls");
 
     CallbackRecord rejecting{context, -1};
     const int rejectedSocket = sockets.Open(server.port);

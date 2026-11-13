@@ -1458,9 +1458,8 @@ int APS5_VABI sceSslDeleteSslConnection(int sslConnectionId) {
     return sceSslDeleteConnection(sslConnectionId);
 }
 
-int APS5_VABI sceSslDisableOption() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslDisableOption(int sslConnectionId, std::uint32_t option) {
+    return sceSslDisableVerifyOption(sslConnectionId, option);
 }
 
 int APS5_VABI sceSslDisableOptionInternal() {
@@ -1473,9 +1472,8 @@ int APS5_VABI sceSslDisableOptionInternalInsecure() {
     return 0;
 }
 
-int APS5_VABI sceSslEnableOption() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceSslEnableOption(int sslConnectionId, std::uint32_t option) {
+    return sceSslEnableVerifyOption(sslConnectionId, option);
 }
 
 int APS5_VABI sceSslEnableOptionInternal() {
